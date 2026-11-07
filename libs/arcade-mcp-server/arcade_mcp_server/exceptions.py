@@ -1,0 +1,141 @@
+"""
+MCP Exception Hierarchy
+
+Provides domain-specific exceptions for better error handling and debugging.
+"""
+
+from arcade_core.errors import (
+    ContextRequiredToolError,
+    ErrorKind,
+    FatalToolError,
+    NetworkTransportError,
+    RetryableToolError,
+    ToolExecutionError,
+    ToolRuntimeError,
+    UpstreamError,
+    UpstreamRateLimitError,
+)
+from arcade_core.schema_validation import (
+    UnsupportedSchemaDialectError as CoreUnsupportedSchemaDialectError,
+)
+
+__all__ = [
+    "AuthorizationError",
+    "ContextRequiredToolError",
+    "ElicitationModeNotSupportedError",
+    "ElicitationNotSupportedError",
+    "ErrorKind",
+    "FatalToolError",
+    "IncompleteAuthContextError",
+    "LifespanError",
+    "MCPContextError",
+    "MCPError",
+    "MCPRuntimeError",
+    "NetworkTransportError",
+    "NotFoundError",
+    "PromptError",
+    "ProtocolError",
+    "RequestError",
+    "ResourceError",
+    "ResponseError",
+    "RetryableToolError",
+    "ServerError",
+    "ServerRequestError",
+    "SessionError",
+    "SessionNotInitializedError",
+    "ToolExecutionError",
+    "ToolRuntimeError",
+    "TransportError",
+    "UnsupportedSchemaDialectError",
+    "UpstreamError",
+    "UpstreamRateLimitError",
+]
+
+
+class MCPError(Exception):
+    """Base error for all MCP-related exceptions."""
+
+
+class MCPRuntimeError(MCPError):
+    """Runtime error for all MCP-related exceptions."""
+
+
+class ServerError(MCPRuntimeError):
+    """Error in server operations."""
+
+
+class SessionError(ServerError):
+    """Error in session management"""
+
+
+class ElicitationNotSupportedError(SessionError):
+    """Client did not declare elicitation capability — server must not send elicitation."""
+
+
+class ElicitationModeNotSupportedError(SessionError):
+    """Client does not support the requested elicitation mode (form or url)."""
+
+
+class RequestError(ServerError):
+    """Error in request processing from client to server"""
+
+
+class ResponseError(ServerError):
+    """Error in request processing from server -> client"""
+
+
+class ServerRequestError(RequestError):
+    """Error in sending request from server -> client initiated by the server"""
+
+
+class LifespanError(ServerError):
+    """Error in lifespan management."""
+
+
+class MCPContextError(MCPError):
+    """Error in context management."""
+
+
+class NotFoundError(MCPContextError):
+    """Requested entity not found."""
+
+
+class AuthorizationError(MCPContextError):
+    """Authorization failure."""
+
+
+class PromptError(MCPContextError):
+    """Error in prompt management."""
+
+
+class ResourceError(MCPContextError):
+    """Error in resource management."""
+
+
+# Transport and Protocol Errors
+
+
+class TransportError(MCPRuntimeError):
+    """Error in transport layer (stdio, HTTP, etc)."""
+
+
+class ProtocolError(MCPRuntimeError):
+    """Error in MCP protocol handling."""
+
+
+class IncompleteAuthContextError(MCPError):
+    """Auth context is missing required claims (e.g., iss) for task scoping."""
+
+
+class UnsupportedSchemaDialectError(MCPError, CoreUnsupportedSchemaDialectError):
+    """Raised when a JSON Schema $schema URI declares an unsupported dialect.
+
+    Inherits from both ``MCPError`` (so framework-level catchers keep
+    working) and ``ValueError`` (so tool authors doing ``except ValueError``
+    around ``context.ui.elicit(...)`` catch bad-dialect errors alongside
+    the rest of ``_validate_elicitation_schema``'s ``ValueError`` family).
+    """
+
+
+class SessionNotInitializedError(SessionError):
+    """Raised when an outbound request is attempted before session initialization."""

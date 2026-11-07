@@ -1,0 +1,1342 @@
+"""Tests for MCPApp initialization and basic functionality."""
+
+import subprocess
+import sys
+from types import ModuleType
+from typing import Annotated
+from unittest.mock import Mock, patch
+
+import pytest
+from arcade_core.catalog import MaterializedTool, ToolDefinitionError
+from arcade_mcp_server import tool
+from arcade_mcp_server.mcp_app import MCPApp
+from arcade_mcp_server.server import MCPServer
+from arcade_mcp_server.types import ToolExecution
+from loguru import logger as loguru_logger
+
+
+class TestMCPAppVersionValidation:
+    """Tests for MCPApp version validation."""
+
+    @pytest.mark.parametrize(
+        "version,expected_result",
+        [
+            # Full semver (passthrough)
+            ("1.0.0", "1.0.0"),
+            ("0.1.0", "0.1.0"),
+            ("0.0.0", "0.0.0"),
+            ("10.20.30", "10.20.30"),
+            # Pre-release and build metadata
+            ("1.2.3-alpha.1", "1.2.3-alpha.1"),
+            ("1.2.3+build.456", "1.2.3+build.456"),
+            ("1.2.3-beta.1+build.789", "1.2.3-beta.1+build.789"),
+            # Short versions (normalized to MAJOR.MINOR.0)
+            ("1.0", "1.0.0"),
+            ("0.1", "0.1.0"),
+            ("2.5", "2.5.0"),
+            ("10.20", "10.20.0"),
+            # Major-only versions (normalized to MAJOR.0.0)
+            ("1", "1.0.0"),
+            ("0", "0.0.0"),
+            ("10", "10.0.0"),
+            # v-prefixed versions (normalized by stripping v)
+            ("v1.0.0", "1.0.0"),
+            ("v0.1.0", "0.1.0"),
+            ("v1.2.3-alpha.1", "1.2.3-alpha.1"),
+            ("v1.0", "1.0.0"),
+            ("v2.5", "2.5.0"),
+            # v-prefixed major-only
+            ("v1", "1.0.0"),
+            ("v0", "0.0.0"),
+            ("v10", "10.0.0"),
+        ],
+    )
+    def test_validate_version_valid_versions(self, version: str, expected_result: str) -> None:
+        """Test _validate_version with valid semver strings."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+        result = app._validate_version(version)
+        assert result == expected_result
+
+    @pytest.mark.parametrize(
+        "version,expected_error",
+        [
+            ("", ValueError),
+            (None, TypeError),
+            (123, TypeError),
+            ([], TypeError),
+            ({}, TypeError),
+            ("1.0.0.0", ValueError),  # too many components
+            ("1.0.0dev", ValueError),  # PEP 440 dev (not semver)
+            ("1.0.0a1", ValueError),  # PEP 440 alpha (not semver)
+            ("1.0.0.post1", ValueError),  # PEP 440 post (not semver)
+            ("not_a_version", ValueError),  # garbage
+            ("latest", ValueError),  # word
+            (" 1.0.0", ValueError),  # leading space
+            ("1.0.0 ", ValueError),  # trailing space
+            ("01.0.0", ValueError),  # leading zero
+        ],
+    )
+    def test_validate_version_invalid_versions(
+        self, version: object, expected_error: type[Exception]
+    ) -> None:
+        """Test _validate_version rejects invalid versions."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+        with pytest.raises(expected_error):
+            app._validate_version(version)  # type: ignore[arg-type]
+
+    def test_mcp_app_rejects_invalid_version_at_init(self) -> None:
+        """Test MCPApp raises at instantiation for invalid version."""
+        with pytest.raises(ValueError, match="semver"):
+            MCPApp(name="TestApp", version="not-valid")
+
+    def test_mcp_app_rejects_invalid_version_via_setter(self) -> None:
+        """Test MCPApp version setter validates and raises for invalid version."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+        with pytest.raises(ValueError, match="semver"):
+            app.version = "bad"
+
+    def test_mcp_app_v_prefix_normalized(self) -> None:
+        """Test v prefix is stripped and version is normalized."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+        assert app._validate_version("v1.0.0") == "1.0.0"
+        assert app._validate_version("v1.0") == "1.0.0"
+        assert app._validate_version("v2.5") == "2.5.0"
+        assert app._validate_version("v1") == "1.0.0"
+
+    def test_multi_digit_versions_accepted(self) -> None:
+        """Test versions like 1.10.0 are accepted."""
+        app = MCPApp(name="TestApp", version="1.10.0")
+        assert app.version == "1.10.0"
+        app2 = MCPApp(name="TestApp", version="1.9.0")
+        assert app2.version == "1.9.0"
+        # 1.10.0 > 1.9.0 in semver; lexicographic would wrongly give 1.10.0 < 1.9.0
+        assert app._validate_version("1.10.0") == "1.10.0"
+        assert app._validate_version("1.9.0") == "1.9.0"
+
+
+class TestMCPApp:
+    """Test MCPApp class."""
+
+    @pytest.fixture
+    def mcp_app(self) -> MCPApp:
+        """Create an MCP app."""
+        app = MCPApp(name="TestMCPApp", version="1.0.0")
+
+        # Add a sample tool so the app doesn't exit when run() is called
+        @app.tool
+        def sample_tool(message: Annotated[str, "A message"]) -> str:
+            """A sample tool for testing."""
+            return f"Response: {message}"
+
+        return app
+
+    def test_mcp_app_initialization(self):
+        """Test MCPApp initialization creates proper settings."""
+        app = MCPApp(
+            name="TestApp",
+            version="1.5.0",
+            title="Test Title",
+            instructions="Test instructions",
+        )
+
+        assert app.name == "TestApp"
+        assert app.version == "1.5.0"
+        assert app.title == "Test Title"
+        assert app.instructions == "Test instructions"
+
+        assert app._mcp_settings is not None
+        assert app._mcp_settings.server.name == "TestApp"
+        assert app._mcp_settings.server.version == "1.5.0"
+        assert app._mcp_settings.server.title == "Test Title"
+        assert app._mcp_settings.server.instructions == "Test instructions"
+
+    def test_mcp_app_initialization_defaults(self):
+        """Test MCPApp initialization with default values."""
+        app = MCPApp()
+
+        assert app.name == "ArcadeMCP"
+        assert app.version == "0.1.0"
+
+        assert app._mcp_settings.server.name == "ArcadeMCP"
+        assert app._mcp_settings.server.version == "0.1.0"
+
+    def test_mcp_app_initialization_partial_values(self):
+        """Test MCPApp initialization with partial values."""
+        app = MCPApp(name="PartialApp")
+
+        assert app.name == "PartialApp"
+        assert app.version == "0.1.0"  # Default value
+
+        assert app._mcp_settings.server.name == "PartialApp"
+        assert app._mcp_settings.server.version == "0.1.0"
+
+    def test_mcp_app_branding_fields_forwarded_to_server_kwargs(self):
+        """Regression: branding fields (icons, description, website_url,
+        allowed_origins) must land in ``server_kwargs`` so that they reach
+        ``MCPServer`` when ``_create_and_run_server`` / ``run_stdio_server``
+        call ``create_arcade_mcp(**self.server_kwargs)``. Previously these
+        named parameters were stored only on ``self`` and the ``**kwargs``
+        channel captured by ``server_kwargs`` was empty of them, so the
+        entire server-branding feature was silently dropped at runtime.
+        """
+        icons = [{"src": "https://example.com/icon.png", "mimeType": "image/png"}]
+        app = MCPApp(
+            name="BrandingApp",
+            version="2.0.0",
+            icons=icons,
+            description="Server description",
+            website_url="https://example.com",
+            allowed_origins=["https://foo.example.com"],
+        )
+
+        # Still addressable as attributes on the app (public API).
+        assert app.icons == icons
+        assert app.description == "Server description"
+        assert app.website_url == "https://example.com"
+        assert app.allowed_origins == ["https://foo.example.com"]
+
+        # MUST also propagate through to the MCPServer constructor.
+        assert app.server_kwargs["icons"] == icons
+        assert app.server_kwargs["description"] == "Server description"
+        assert app.server_kwargs["website_url"] == "https://example.com"
+        assert app.server_kwargs["allowed_origins"] == ["https://foo.example.com"]
+
+    def test_mcp_app_branding_fields_omitted_when_none(self):
+        """When branding fields are not supplied, ``server_kwargs`` must not
+        carry None-valued entries (they'd shadow any defaults on the
+        downstream server constructor).
+        """
+        app = MCPApp(name="NoBranding")
+        assert "icons" not in app.server_kwargs
+        assert "description" not in app.server_kwargs
+        assert "website_url" not in app.server_kwargs
+        assert "allowed_origins" not in app.server_kwargs
+
+    def test_add_tool(self, mcp_app: MCPApp):
+        """Test adding a tool to the MCP app."""
+
+        def undecorated_sample_tool(
+            text: Annotated[str, "Input text"],
+        ) -> Annotated[str, "Echoed text"]:
+            """Echo input text back to the caller."""
+            return f"Echo: {text}"
+
+        @tool
+        def decorated_sample_tool(
+            text: Annotated[str, "Input text"],
+        ) -> Annotated[str, "Echoed text"]:
+            """Echo input text back to the caller."""
+            return f"Echo: {text}"
+
+        previous_tools = len(mcp_app._catalog)
+
+        undecorated_tool = mcp_app.add_tool(undecorated_sample_tool)
+        decorated_tool = mcp_app.add_tool(decorated_sample_tool)
+
+        assert len(mcp_app._catalog) == previous_tools + 2
+
+        # Verify tool has the @tool decorator applied
+        assert hasattr(undecorated_tool, "__tool_name__")
+        assert undecorated_tool.__tool_name__ == "UndecoratedSampleTool"
+        assert hasattr(decorated_tool, "__tool_name__")
+        assert decorated_tool.__tool_name__ == "DecoratedSampleTool"
+
+    def test_tool(self, mcp_app: MCPApp):
+        """Test the MCPApp tool decorator."""
+
+        initial_tool_count = len(mcp_app._catalog)
+
+        # Test decorator without parameters
+        @mcp_app.tool
+        def simple_tool(message: Annotated[str, "A message"]) -> str:
+            """A simple tool."""
+            return f"Response: {message}"
+
+        # Test decorator with parameters
+        @mcp_app.tool(name="SimpleTool2")
+        def simple_tool2(message: Annotated[str, "A message"]) -> str:
+            """A simple tool."""
+            return f"Response: {message}"
+
+        # Verify both tools were added
+        assert len(mcp_app._catalog) == initial_tool_count + 2
+
+        # Verify decorator attributes
+        assert hasattr(simple_tool, "__tool_name__")
+        assert simple_tool.__tool_name__ == "SimpleTool"
+        assert hasattr(simple_tool2, "__tool_name__")
+        assert simple_tool2.__tool_name__ == "SimpleTool2"
+        # Verify tools can still be called
+        assert simple_tool("test") == "Response: test"
+        assert simple_tool2("test") == "Response: test"
+
+    def test_tool_decorator_plumbs_execution_kwarg(self, mcp_app: MCPApp):
+        """``@mcp_app.tool(execution=...)`` writes the dunder used by the
+        MCP wire conversion / taskSupport policy enforcement.
+        """
+        execution = ToolExecution(taskSupport="optional")
+
+        @mcp_app.tool(execution=execution)
+        def reportable_tool(message: Annotated[str, "A message"]) -> str:
+            """A tool that supports task augmentation."""
+            return f"Response: {message}"
+
+        assert reportable_tool.__tool_execution__ is execution
+        assert reportable_tool.__tool_execution__.taskSupport == "optional"
+
+    def test_add_tool_plumbs_execution_kwarg(self, mcp_app: MCPApp):
+        """``app.add_tool(func, execution=...)`` (no pre-decoration) sets
+        the dunder so the registration path is symmetric with
+        ``@app.tool``.
+        """
+        execution = ToolExecution(taskSupport="required")
+
+        def background_tool(message: Annotated[str, "A message"]) -> str:
+            """A tool that must be invoked as a task."""
+            return f"Response: {message}"
+
+        registered = mcp_app.add_tool(background_tool, execution=execution)
+        assert registered.__tool_execution__ is execution
+        assert registered.__tool_execution__.taskSupport == "required"
+
+    def test_add_tool_execution_kwarg_overrides_pre_decoration(self, mcp_app: MCPApp):
+        """A pre-decorated ``@tool(execution=...)`` callable can have its
+        policy overridden by an explicit ``execution=`` at ``add_tool``
+        time. This pins the documented override semantic.
+        """
+
+        @tool(execution=ToolExecution(taskSupport="optional"))
+        def overridable_tool(message: Annotated[str, "A message"]) -> str:
+            """A tool registered with one policy and overridden at add_tool."""
+            return f"Response: {message}"
+
+        override = ToolExecution(taskSupport="forbidden")
+        registered = mcp_app.add_tool(overridable_tool, execution=override)
+        assert registered.__tool_execution__ is override
+
+    def test_add_tool_execution_kwarg_omitted_preserves_pre_decoration(self, mcp_app: MCPApp):
+        """When ``add_tool`` is called without ``execution=`` on a
+        pre-decorated tool, the pre-decoration's policy is preserved.
+        """
+        pre = ToolExecution(taskSupport="optional")
+
+        @tool(execution=pre)
+        def pre_decorated_tool(message: Annotated[str, "A message"]) -> str:
+            """Pre-decorated tool."""
+            return f"Response: {message}"
+
+        registered = mcp_app.add_tool(pre_decorated_tool)
+        assert registered.__tool_execution__ is pre
+
+    @pytest.mark.asyncio
+    async def test_tools_api(
+        self, mcp_app: MCPApp, mcp_server: MCPServer, materialized_tool: MaterializedTool
+    ):
+        """Test the tools API."""
+        # Test that tools API requires server binding
+        with pytest.raises(Exception):  # noqa: B017
+            await mcp_app.tools.add(materialized_tool)
+
+        # Bind server to app (instead of calling mcp_app.run())
+        mcp_app.server = mcp_server
+
+        # Test removing a tool at runtime
+        removed_tool = await mcp_app.tools.remove(materialized_tool.definition.fully_qualified_name)
+        assert (
+            removed_tool.definition.fully_qualified_name
+            == materialized_tool.definition.fully_qualified_name
+        )
+
+        num_tools_before_add = len(await mcp_app.tools.list())
+
+        # Test adding a tool at runtime
+        await mcp_app.tools.add(materialized_tool)
+
+        # Test listing tools at runtime
+        tools = await mcp_app.tools.list()
+        assert len(tools) == num_tools_before_add + 1
+
+        # Test updating a tool at runtime
+        await mcp_app.tools.update(materialized_tool)
+
+    @pytest.mark.asyncio
+    async def test_prompts_api(self, mcp_app: MCPApp, mcp_server):
+        """Test the prompts API."""
+        from arcade_mcp_server.types import Prompt, PromptArgument, PromptMessage
+
+        # Test that prompts API requires server binding
+        sample_prompt = Prompt(
+            name="test_prompt",
+            description="A test prompt",
+            arguments=[PromptArgument(name="input", description="Test input", required=True)],
+        )
+
+        with pytest.raises(Exception) as exc_info:
+            await mcp_app.prompts.add(sample_prompt)
+        assert "No server bound to app" in str(exc_info.value)
+
+        # Bind server to app
+        mcp_app.server = mcp_server
+
+        # Create a prompt handler
+        async def test_handler(args: dict[str, str]) -> list[PromptMessage]:
+            return [
+                PromptMessage(
+                    role="user",
+                    content={"type": "text", "text": f"Hello {args.get('input', 'world')}"},
+                )
+            ]
+
+        # Test adding a prompt at runtime
+        await mcp_app.prompts.add(sample_prompt, test_handler)
+
+        # Test listing prompts at runtime
+        prompts = await mcp_app.prompts.list()
+        assert len(prompts) == 1
+        assert any(p.name == "test_prompt" for p in prompts)
+
+        # Test removing a prompt at runtime
+        removed_prompt = await mcp_app.prompts.remove("test_prompt")
+        assert removed_prompt.name == "test_prompt"
+
+    @pytest.mark.asyncio
+    async def test_resources_api(self, mcp_app: MCPApp, mcp_server):
+        """Test the resources API."""
+        from arcade_mcp_server.types import Resource
+
+        # Test that resources API requires server binding
+        sample_resource = Resource(
+            uri="file:///test.txt",
+            name="test.txt",
+            description="A test text file",
+            mimeType="text/plain",
+        )
+
+        with pytest.raises(Exception) as exc_info:
+            await mcp_app.resources.add(sample_resource)
+        assert "No server bound to app" in str(exc_info.value)
+
+        # Bind server to app
+        mcp_app.server = mcp_server
+
+        # Create a resource handler
+        def test_handler(uri: str):
+            return {"content": f"Content for {uri}", "mimeType": "text/plain"}
+
+        # Test adding a resource at runtime
+        await mcp_app.resources.add(sample_resource, test_handler)
+
+        # Test listing resources at runtime
+        resources = await mcp_app.resources.list()
+        assert len(resources) >= 1
+        assert any(r.uri == "file:///test.txt" for r in resources)
+
+        # Test removing a resource at runtime
+        removed_resource = await mcp_app.resources.remove("file:///test.txt")
+        assert removed_resource.uri == "file:///test.txt"
+
+    def test_get_configuration_overrides(self, monkeypatch):
+        """Test configuration overrides from environment variables."""
+        # Ensure environment variables are clear at the start
+        monkeypatch.delenv("ARCADE_SERVER_TRANSPORT", raising=False)
+        monkeypatch.delenv("ARCADE_SERVER_HOST", raising=False)
+        monkeypatch.delenv("ARCADE_SERVER_PORT", raising=False)
+        monkeypatch.delenv("ARCADE_SERVER_RELOAD", raising=False)
+
+        # Test default values (no environment variables)
+        host, port, transport, reload = MCPApp._get_configuration_overrides(
+            "127.0.0.1", 8000, "http", False
+        )
+        assert host == "127.0.0.1"
+        assert port == 8000
+        assert transport == "http"
+        assert not reload
+
+        # Test transport override
+        monkeypatch.setenv("ARCADE_SERVER_TRANSPORT", "stdio")
+        host, port, transport, reload = MCPApp._get_configuration_overrides(
+            "127.0.0.1", 8000, "http", False
+        )
+        assert transport == "stdio"
+        monkeypatch.delenv("ARCADE_SERVER_TRANSPORT")
+
+        # Test host override (only works with HTTP transport)
+        monkeypatch.setenv("ARCADE_SERVER_TRANSPORT", "http")
+        monkeypatch.setenv("ARCADE_SERVER_HOST", "192.168.1.1")
+        host, port, transport, reload = MCPApp._get_configuration_overrides(
+            "127.0.0.1", 8000, "http", False
+        )
+        assert host == "192.168.1.1"
+        assert transport == "http"
+        monkeypatch.delenv("ARCADE_SERVER_HOST")
+        monkeypatch.delenv("ARCADE_SERVER_TRANSPORT")
+
+        # Test port override (only works with HTTP transport)
+        monkeypatch.setenv("ARCADE_SERVER_PORT", "9000")
+        host, port, transport, reload = MCPApp._get_configuration_overrides(
+            "127.0.0.1", 8000, "http", False
+        )
+        assert port == 9000
+        monkeypatch.delenv("ARCADE_SERVER_PORT")
+
+        # Test invalid port value
+        monkeypatch.setenv("ARCADE_SERVER_TRANSPORT", "http")
+        monkeypatch.setenv("ARCADE_SERVER_PORT", "invalid_port")
+        host, port, transport, reload = MCPApp._get_configuration_overrides(
+            "127.0.0.1", 8000, "http", False
+        )
+        assert port == 8000  # Should keep the default value
+        monkeypatch.delenv("ARCADE_SERVER_PORT")
+        monkeypatch.delenv("ARCADE_SERVER_TRANSPORT")
+
+        # Test valid reload value
+        monkeypatch.setenv("ARCADE_SERVER_TRANSPORT", "http")
+        monkeypatch.setenv("ARCADE_SERVER_RELOAD", "1")
+        host, port, transport, reload = MCPApp._get_configuration_overrides(
+            "127.0.0.1", 8000, "http", False
+        )
+        assert reload
+        monkeypatch.delenv("ARCADE_SERVER_RELOAD")
+        monkeypatch.delenv("ARCADE_SERVER_TRANSPORT")
+
+        # Test invalid reload value
+        monkeypatch.setenv("ARCADE_SERVER_TRANSPORT", "http")
+        monkeypatch.setenv("ARCADE_SERVER_RELOAD", "invalid_reload")
+        host, port, transport, reload = MCPApp._get_configuration_overrides(
+            "127.0.0.1", 8000, "http", False
+        )
+        assert not reload  # Should keep the default value
+        monkeypatch.delenv("ARCADE_SERVER_RELOAD")
+        monkeypatch.delenv("ARCADE_SERVER_TRANSPORT")
+
+        # Test host/port/reload with stdio transport
+        monkeypatch.setenv("ARCADE_SERVER_TRANSPORT", "stdio")
+        monkeypatch.setenv("ARCADE_SERVER_HOST", "192.168.1.1")
+        monkeypatch.setenv("ARCADE_SERVER_PORT", "9000")
+        monkeypatch.setenv("ARCADE_SERVER_RELOAD", "true")
+        host, port, transport, reload = MCPApp._get_configuration_overrides(
+            "127.0.0.1", 8000, "http", False
+        )
+        # For stdio, host, port, and reload are still returned but not used by the server
+        assert host == "127.0.0.1"  # Host should remain unchanged for stdio transport
+        assert port == 8000  # Port should remain unchanged for stdio transport
+        assert transport == "stdio"
+        assert not reload
+        monkeypatch.delenv("ARCADE_SERVER_RELOAD")
+        monkeypatch.delenv("ARCADE_SERVER_HOST")
+        monkeypatch.delenv("ARCADE_SERVER_PORT")
+        monkeypatch.delenv("ARCADE_SERVER_TRANSPORT")
+
+    def test_create_and_run_server(self, mcp_app: MCPApp):
+        """Test _create_and_run_server method with mocked dependencies."""
+        with (
+            patch("arcade_mcp_server.mcp_app.create_arcade_mcp") as mock_create,
+            patch("arcade_mcp_server.mcp_app.serve_with_force_quit") as mock_serve,
+        ):
+            mock_fastapi_app = Mock()
+            mock_create.return_value = mock_fastapi_app
+
+            # Test with INFO log level
+            mcp_app.log_level = "INFO"
+            mcp_app._create_and_run_server("127.0.0.1", 8000)
+
+            mock_create.assert_called_once_with(
+                catalog=mcp_app._catalog,
+                mcp_settings=mcp_app._mcp_settings,
+                debug=False,
+                resource_server_validator=mcp_app.resource_server_validator,
+                initial_resources=mcp_app._initial_resources,
+                tool_meta_extensions=mcp_app._tool_meta_extensions,
+            )
+            mock_serve.assert_called_once_with(
+                app=mock_fastapi_app,
+                host="127.0.0.1",
+                port=8000,
+                log_level="info",
+            )
+
+        # Test with DEBUG log level
+        with (
+            patch("arcade_mcp_server.mcp_app.create_arcade_mcp") as mock_create,
+            patch("arcade_mcp_server.mcp_app.serve_with_force_quit") as mock_serve,
+        ):
+            mock_fastapi_app = Mock()
+            mock_create.return_value = mock_fastapi_app
+
+            mcp_app.log_level = "DEBUG"
+            mcp_app._create_and_run_server("192.168.1.1", 9000)
+
+            mock_create.assert_called_once_with(
+                catalog=mcp_app._catalog,
+                mcp_settings=mcp_app._mcp_settings,
+                debug=True,
+                resource_server_validator=mcp_app.resource_server_validator,
+                initial_resources=mcp_app._initial_resources,
+                tool_meta_extensions=mcp_app._tool_meta_extensions,
+            )
+            mock_serve.assert_called_once_with(
+                app=mock_fastapi_app,
+                host="192.168.1.1",
+                port=9000,
+                log_level="debug",
+            )
+
+    def test_run_with_reload_spawns_child_process(self, mcp_app: MCPApp):
+        """Test _run_with_reload spawns child process with correct environment."""
+        mock_process = Mock()
+        mock_process.terminate = Mock()
+        mock_process.wait = Mock()
+
+        with (
+            patch("arcade_mcp_server.mcp_app.subprocess.Popen") as mock_popen,
+            patch("arcade_mcp_server.mcp_app.watch") as mock_watch,
+        ):
+            mock_popen.return_value = mock_process
+            # Return empty iterator to exit immediately
+            mock_watch.return_value = iter([])
+
+            mcp_app._run_with_reload("127.0.0.1", 8000)
+
+            # Verify Popen was called with correct args
+            mock_popen.assert_called_once()
+            call_args = mock_popen.call_args
+            assert call_args[0][0] == [sys.executable, *sys.argv]
+            assert call_args[1]["env"]["ARCADE_MCP_CHILD_PROCESS"] == "1"
+
+    def test_run_with_reload_restarts_on_changes(self, mcp_app: MCPApp):
+        """Test _run_with_reload restarts server when file changes detected."""
+        mock_process1 = Mock()
+        mock_process2 = Mock()
+
+        with (
+            patch("arcade_mcp_server.mcp_app.subprocess.Popen") as mock_popen,
+            patch("arcade_mcp_server.mcp_app.watch") as mock_watch,
+        ):
+            mock_popen.side_effect = [mock_process1, mock_process2]
+            # Yield one set of changes then stop
+            mock_watch.return_value = iter([{("change", "test.py")}])
+
+            mcp_app._run_with_reload("127.0.0.1", 8000)
+
+            # Verify both processes were created
+            assert mock_popen.call_count == 2
+
+            # Verify first process was shut down.
+            # On Windows, shutdown uses send_signal(CTRL_BREAK_EVENT) instead
+            # of terminate() for graceful shutdown.
+            if sys.platform == "win32":
+                mock_process1.send_signal.assert_called_once()
+            else:
+                mock_process1.terminate.assert_called_once()
+            mock_process1.wait.assert_called()
+
+    def test_run_with_reload_graceful_shutdown(self, mcp_app: MCPApp):
+        """Test _run_with_reload gracefully shuts down process."""
+        mock_process = Mock()
+        mock_process.wait = Mock()  # Succeeds without timeout
+
+        with (
+            patch("arcade_mcp_server.mcp_app.subprocess.Popen") as mock_popen,
+            patch("arcade_mcp_server.mcp_app.watch") as mock_watch,
+        ):
+            mock_popen.return_value = mock_process
+            mock_watch.return_value = iter([{("change", "test.py")}])
+
+            mcp_app._run_with_reload("127.0.0.1", 8000)
+
+            # Verify graceful shutdown.
+            # On Windows, send_signal(CTRL_BREAK_EVENT) is used instead of
+            # terminate() to allow graceful child cleanup.
+            if sys.platform == "win32":
+                mock_process.send_signal.assert_called()
+            else:
+                mock_process.terminate.assert_called()
+            mock_process.wait.assert_called()
+            mock_process.kill.assert_not_called()
+
+    def test_run_with_reload_force_kill_on_timeout(self, mcp_app: MCPApp):
+        """Test _run_with_reload force kills process on timeout."""
+        mock_process = Mock()
+        # First wait times out, second succeeds
+        mock_process.wait = Mock(side_effect=[subprocess.TimeoutExpired("cmd", 5), None])
+
+        with (
+            patch("arcade_mcp_server.mcp_app.subprocess.Popen") as mock_popen,
+            patch("arcade_mcp_server.mcp_app.watch") as mock_watch,
+        ):
+            mock_popen.return_value = mock_process
+            mock_watch.return_value = iter([{("change", "test.py")}])
+
+            mcp_app._run_with_reload("127.0.0.1", 8000)
+
+            # Verify shutdown -> wait -> kill -> wait sequence.
+            # On Windows, send_signal is used instead of terminate.
+            if sys.platform == "win32":
+                mock_process.send_signal.assert_called()
+            else:
+                mock_process.terminate.assert_called()
+            assert mock_process.wait.call_count == 2
+            mock_process.kill.assert_called_once()
+
+    def test_run_with_reload_keyboard_interrupt(self, mcp_app: MCPApp):
+        """Test _run_with_reload handles KeyboardInterrupt gracefully."""
+        mock_process = Mock()
+
+        with (
+            patch("arcade_mcp_server.mcp_app.subprocess.Popen") as mock_popen,
+            patch("arcade_mcp_server.mcp_app.watch") as mock_watch,
+        ):
+            mock_popen.return_value = mock_process
+            mock_watch.side_effect = KeyboardInterrupt()
+
+            # Should not raise exception
+            mcp_app._run_with_reload("127.0.0.1", 8000)
+
+            # Verify process was shut down.
+            if sys.platform == "win32":
+                mock_process.send_signal.assert_called_once()
+            else:
+                mock_process.terminate.assert_called_once()
+
+    def test_run_routes_to_reload_method(self, mcp_app: MCPApp):
+        """Test run() routes to _run_with_reload when reload=True."""
+        with (
+            patch.object(mcp_app, "_run_with_reload") as mock_reload,
+            patch.object(mcp_app, "_create_and_run_server") as mock_direct,
+        ):
+            mcp_app.run(reload=True, transport="http", host="127.0.0.1", port=8000)
+
+            mock_reload.assert_called_once_with("127.0.0.1", 8000)
+            mock_direct.assert_not_called()
+
+    def test_run_routes_to_direct_method(self, mcp_app: MCPApp):
+        """Test run() routes to _create_and_run_server when reload=False."""
+        with (
+            patch.object(mcp_app, "_run_with_reload") as mock_reload,
+            patch.object(mcp_app, "_create_and_run_server") as mock_direct,
+        ):
+            mcp_app.run(reload=False, transport="http", host="127.0.0.1", port=8000)
+
+            mock_direct.assert_called_once_with("127.0.0.1", 8000)
+            mock_reload.assert_not_called()
+
+    def test_run_http_silent_about_resource_server_auth_when_worker_secret_set(
+        self, mcp_app: MCPApp
+    ):
+        """HTTP transport with worker secret set must not log about MCP-route auth.
+
+        ``MCPApp.run()`` calls ``_setup_logging`` which itself calls
+        ``logger.remove()`` — patch it to a no-op so our capture sink survives.
+        """
+        mcp_app._mcp_settings.arcade.server_secret = "some-worker-secret"
+        mcp_app.resource_server_validator = None
+
+        captured: list[dict] = []
+        with patch.object(mcp_app, "_setup_logging"):
+            sink_id = loguru_logger.add(
+                lambda message: captured.append(dict(message.record)),
+                level="INFO",
+                format="{message}",
+            )
+            try:
+                with patch.object(mcp_app, "_create_and_run_server"):
+                    mcp_app.run(reload=False, transport="http", host="127.0.0.1", port=8000)
+            finally:
+                loguru_logger.remove(sink_id)
+
+        assert not any(
+            "Resource Server authentication" in r["message"] or "MCP routes" in r["message"]
+            for r in captured
+        )
+
+    def test_run_child_process_disables_reload(self, mcp_app: MCPApp, monkeypatch):
+        """Test run() disables reload when ARCADE_MCP_CHILD_PROCESS is set."""
+        monkeypatch.setenv("ARCADE_MCP_CHILD_PROCESS", "1")
+
+        with (
+            patch.object(mcp_app, "_run_with_reload") as mock_reload,
+            patch.object(mcp_app, "_create_and_run_server") as mock_direct,
+        ):
+            mcp_app.run(reload=True, transport="http", host="127.0.0.1", port=8000)
+
+            # Should route to direct method even though reload=True
+            mock_direct.assert_called_once_with("127.0.0.1", 8000)
+            mock_reload.assert_not_called()
+
+    def test_run_stdio_unaffected_by_reload(self, mcp_app: MCPApp):
+        """Test run() with stdio transport is unaffected by reload flag."""
+        with patch("arcade_mcp_server.stdio_runner.run_stdio_server") as mock_stdio:
+            # Test with reload=True
+            mcp_app.run(reload=True, transport="stdio")
+            mock_stdio.assert_called_once()
+
+            mock_stdio.reset_mock()
+
+            # Test with reload=False
+            mcp_app.run(reload=False, transport="stdio")
+            mock_stdio.assert_called_once()
+
+    @pytest.mark.parametrize(
+        "name,expected_result",
+        [
+            # Valid names
+            ("ValidName", "ValidName"),
+            ("valid_name", "valid_name"),
+            ("ValidName123", "ValidName123"),
+            ("valid_name_123", "valid_name_123"),
+            ("a", "a"),
+            ("A", "A"),
+            ("1", "1"),
+            ("name1", "name1"),
+            ("Name1", "Name1"),
+            ("validName", "validName"),
+            ("Valid_Name", "Valid_Name"),
+            ("valid_name_test", "valid_name_test"),
+            ("Test123Name", "Test123Name"),
+            ("a1b2c3", "a1b2c3"),
+            ("A1B2C3", "A1B2C3"),
+        ],
+    )
+    def test_validate_name_valid_names(self, name: str, expected_result: str):
+        """Test _validate_name with valid names."""
+        app = MCPApp()
+        result = app._validate_name(name)
+        assert result == expected_result
+
+    @pytest.mark.parametrize(
+        "name,expected_error",
+        [
+            # Empty name
+            ("", ValueError),
+            # Non-string types
+            (None, TypeError),
+            (123, TypeError),
+            ([], TypeError),
+            ({}, TypeError),
+            # Names starting with underscore
+            ("_invalid", ValueError),
+            ("_name", ValueError),
+            ("_123", ValueError),
+            ("_", ValueError),
+            # Names with consecutive underscores
+            ("name__test", ValueError),
+            ("test__name", ValueError),
+            ("__name", ValueError),
+            ("name__", ValueError),
+            ("__", ValueError),
+            # Names ending with underscore
+            ("name_", ValueError),
+            ("test_", ValueError),
+            ("_", ValueError),
+            # Names with invalid characters
+            ("name-test", ValueError),
+            ("name.test", ValueError),
+            ("name test", ValueError),
+            ("name@test", ValueError),
+            ("name#test", ValueError),
+            ("name$test", ValueError),
+            ("name%test", ValueError),
+            ("name^test", ValueError),
+            ("name&test", ValueError),
+            ("name*test", ValueError),
+            ("name+test", ValueError),
+            ("name=test", ValueError),
+            ("name[test", ValueError),
+            ("name]test", ValueError),
+            ("name{test", ValueError),
+            ("name}test", ValueError),
+            ("name|test", ValueError),
+            ("name\\test", ValueError),
+            ("name:test", ValueError),
+            ("name;test", ValueError),
+            ("name'test", ValueError),
+            ('name"test', ValueError),
+            ("name<test", ValueError),
+            ("name>test", ValueError),
+            ("name,test", ValueError),
+            ("name.test", ValueError),
+            ("name?test", ValueError),
+            ("name/test", ValueError),
+            ("name!test", ValueError),
+            ("name~test", ValueError),
+            ("name`test", ValueError),
+            # Names with spaces
+            ("name test", ValueError),
+            (" name", ValueError),
+            ("name ", ValueError),
+            (" name ", ValueError),
+            # Names with special unicode characters
+            ("nameñ", ValueError),
+            ("nameé", ValueError),
+            ("name中", ValueError),
+            ("name🚀", ValueError),
+        ],
+    )
+    def test_validate_name_invalid_names(self, name, expected_error):
+        """Test _validate_name with invalid names."""
+        app = MCPApp()
+        with pytest.raises(expected_error):
+            app._validate_name(name)
+
+
+class TestMCPAppResourceRegistration:
+    """Tests for build-time resource registration on MCPApp."""
+
+    def test_add_resource_stores_resource(self):
+        """Verify add_resource stores a (Resource, None) tuple in _initial_resources."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app.add_resource("ui://app/index.html", name="App UI", mime_type="text/html")
+
+        assert len(app._initial_resources) == 1
+        resource, handler = app._initial_resources[0]
+        assert resource.uri == "ui://app/index.html"
+        assert resource.name == "App UI"
+        assert resource.mimeType == "text/html"
+        assert handler is None
+
+    def test_add_resource_with_handler(self):
+        """Verify handler is stored alongside resource."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        def my_handler(uri: str) -> str:
+            return "content"
+
+        app.add_resource("file:///data.json", name="Data", handler=my_handler)
+
+        assert len(app._initial_resources) == 1
+        resource, handler = app._initial_resources[0]
+        assert resource.uri == "file:///data.json"
+        assert handler is my_handler
+
+    def test_add_resource_name_defaults_to_uri(self):
+        """Name defaults to URI when omitted."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app.add_resource("ui://app/page.html")
+
+        resource, _ = app._initial_resources[0]
+        assert resource.name == "ui://app/page.html"
+
+    def test_add_resource_with_title(self):
+        """Verify title is set on the Resource object."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app.add_resource(
+            "ui://app/index.html",
+            name="App UI",
+            title="My Application",
+            mime_type="text/html",
+        )
+
+        resource, _ = app._initial_resources[0]
+        assert resource.title == "My Application"
+
+    def test_resource_decorator_with_title(self):
+        """Verify title is passed through from the decorator."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        @app.resource("ui://app/index.html", title="My App UI")
+        def serve_ui(uri: str) -> str:
+            return "<html></html>"
+
+        resource, _ = app._initial_resources[0]
+        assert resource.title == "My App UI"
+
+    def test_resource_decorator_registers_resource(self):
+        """@app.resource(uri) stores (Resource, fn)."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        @app.resource("ui://app/index.html", mime_type="text/html")
+        def serve_ui(uri: str) -> str:
+            return "<html></html>"
+
+        assert len(app._initial_resources) == 1
+        resource, handler = app._initial_resources[0]
+        assert resource.uri == "ui://app/index.html"
+        assert handler is serve_ui
+
+    def test_resource_decorator_name_defaults_to_function_name(self):
+        """Name defaults to fn.__name__ when using decorator."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        @app.resource("ui://app/index.html")
+        def serve_ui(uri: str) -> str:
+            return "<html></html>"
+
+        resource, _ = app._initial_resources[0]
+        assert resource.name == "serve_ui"
+
+    def test_resource_decorator_preserves_function(self):
+        """Decorated function is still directly callable."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        @app.resource("ui://app/index.html")
+        def serve_ui(uri: str) -> str:
+            return f"content for {uri}"
+
+        assert serve_ui("test://uri") == "content for test://uri"
+
+    def test_multiple_resources_registered(self):
+        """Multiple add_resource + decorator calls accumulate."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        app.add_resource("file:///a.txt", name="A")
+        app.add_resource("file:///b.txt", name="B")
+
+        @app.resource("ui://app/index.html")
+        def serve_ui(uri: str) -> str:
+            return "<html></html>"
+
+        assert len(app._initial_resources) == 3
+
+    def test_run_exits_when_no_tools_or_resources(self):
+        """run() exits when neither tools nor resources are registered."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+        with pytest.raises(SystemExit):
+            app.run(transport="http")
+
+    def test_run_allows_resource_only_server(self):
+        """run() does not exit when only resources are registered (no tools)."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app.add_resource("ui://app/index.html", name="App UI")
+
+        with (
+            patch("arcade_mcp_server.mcp_app.create_arcade_mcp") as mock_create,
+            patch("arcade_mcp_server.mcp_app.serve_with_force_quit"),
+        ):
+            mock_create.return_value = Mock()
+            # Should NOT raise SystemExit
+            app.run(transport="http", host="127.0.0.1", port=8000)
+
+    def test_tool_with_meta(self):
+        """@app.tool(meta=...) stores _meta extension."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        @app.tool(meta={"ui": {"resourceUri": "ui://test-app/index.html"}})
+        def get_data(query: Annotated[str, "A query"]) -> str:
+            """Get data."""
+            return "data"
+
+        assert "TestApp.GetData" in app._tool_meta_extensions
+        assert app._tool_meta_extensions["TestApp.GetData"] == {
+            "ui": {"resourceUri": "ui://test-app/index.html"}
+        }
+
+    def test_add_tool_with_meta(self):
+        """add_tool(meta=...) stores _meta extension."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        def my_tool(x: Annotated[str, "input"]) -> str:
+            """A tool."""
+            return x
+
+        app.add_tool(my_tool, meta={"ui": {"resourceUri": "ui://my-tool/index.html"}})
+
+        assert "TestApp.MyTool" in app._tool_meta_extensions
+        assert app._tool_meta_extensions["TestApp.MyTool"] == {
+            "ui": {"resourceUri": "ui://my-tool/index.html"}
+        }
+
+    def test_tool_with_meta_arbitrary_keys(self):
+        """meta with arbitrary keys is stored as-is."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        @app.tool(meta={"custom": {"key": "value"}, "other": 42})
+        def do_stuff(x: Annotated[str, "input"]) -> str:
+            """A tool."""
+            return x
+
+        assert "TestApp.DoStuff" in app._tool_meta_extensions
+        assert app._tool_meta_extensions["TestApp.DoStuff"] == {
+            "custom": {"key": "value"},
+            "other": 42,
+        }
+
+    def test_tool_with_meta_arcade_key_raises(self):
+        """meta containing 'arcade' key raises ToolDefinitionError."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        with pytest.raises(ToolDefinitionError, match="'arcade' key in meta is reserved"):
+
+            @app.tool(meta={"arcade": {"something": True}})
+            def bad_tool(x: Annotated[str, "input"]) -> str:
+                """A tool."""
+                return x
+
+    def test_tool_with_meta_empty_or_none(self):
+        """meta={} and meta=None do not create _tool_meta_extensions entries."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        @app.tool(meta={})
+        def tool_empty(x: Annotated[str, "input"]) -> str:
+            """A tool."""
+            return x
+
+        @app.tool(meta=None)
+        def tool_none(x: Annotated[str, "input"]) -> str:
+            """A tool."""
+            return x
+
+        assert "TestApp.ToolEmpty" not in app._tool_meta_extensions
+        assert "TestApp.ToolNone" not in app._tool_meta_extensions
+
+
+class TestMCPAppResourceAnnotationsMetaTemplates:
+    """Test MCPApp resource registration with annotations, meta, and templates."""
+
+    def test_add_resource_with_annotations(self):
+        from arcade_mcp_server.types import Annotations, Resource
+
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app.add_resource(
+            "res://test",
+            annotations=Annotations(priority=0.5),
+        )
+        assert len(app._initial_resources) == 1
+        item, _handler = app._initial_resources[0]
+        assert isinstance(item, Resource)
+        assert item.annotations is not None
+        assert item.annotations.priority == 0.5
+
+    def test_add_resource_with_meta(self):
+        from arcade_mcp_server.types import Resource
+
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app.add_resource(
+            "res://test",
+            meta={"custom": "value"},
+        )
+        item, _ = app._initial_resources[0]
+        assert isinstance(item, Resource)
+        assert item.meta == {"custom": "value"}
+
+    def test_resource_decorator_with_annotations(self):
+        from arcade_mcp_server.types import Annotations, Resource
+
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        @app.resource("res://dec", annotations=Annotations(priority=0.8))
+        def handler(uri: str) -> str:
+            return "ok"
+
+        item, _ = app._initial_resources[0]
+        assert isinstance(item, Resource)
+        assert item.annotations is not None
+        assert item.annotations.priority == 0.8
+
+    def test_resource_decorator_with_meta(self):
+        from arcade_mcp_server.types import Resource
+
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        @app.resource("res://dec", meta={"key": "val"})
+        def handler(uri: str) -> str:
+            return "ok"
+
+        item, _ = app._initial_resources[0]
+        assert isinstance(item, Resource)
+        assert item.meta == {"key": "val"}
+
+    def test_resource_decorator_with_template_uri(self):
+        from arcade_mcp_server.types import ResourceTemplate
+
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        @app.resource("weather://{city}/current")
+        def handler(uri: str, city: str) -> str:
+            return f"Weather for {city}"
+
+        item, _ = app._initial_resources[0]
+        assert isinstance(item, ResourceTemplate)
+        assert item.uriTemplate == "weather://{city}/current"
+
+    def test_resource_decorator_template_listed_as_template(self):
+        from arcade_mcp_server.types import Resource, ResourceTemplate
+
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        @app.resource("weather://{city}/current")
+        def handler(uri: str, city: str) -> str:
+            return f"Weather for {city}"
+
+        # Should be ResourceTemplate, not Resource
+        item, _ = app._initial_resources[0]
+        assert isinstance(item, ResourceTemplate)
+        assert not isinstance(item, Resource)
+
+    def test_mcp_app_add_text_resource(self):
+        from arcade_mcp_server.types import Resource
+
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app.add_text_resource("text://hello", text="hello world")
+
+        assert len(app._initial_resources) == 1
+        item, handler = app._initial_resources[0]
+        assert isinstance(item, Resource)
+        assert handler is not None
+
+    def test_mcp_app_add_file_resource(self, tmp_path):
+        from arcade_mcp_server.types import Resource
+
+        f = tmp_path / "test.txt"
+        f.write_text("file content")
+
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app.add_file_resource(
+            "file:///test.txt",
+            path=str(f),
+            name="Test File",
+            mime_type="text/plain",
+        )
+
+        assert len(app._initial_resources) == 1
+        item, handler = app._initial_resources[0]
+        assert isinstance(item, Resource)
+        assert item.name == "Test File"
+        assert handler is not None
+        # Handler should return the file content
+        assert handler("file:///test.txt") == "file content"
+
+    def test_mcp_app_add_file_resource_binary(self, tmp_path):
+        f = tmp_path / "image.bin"
+        f.write_bytes(b"\x89PNG\r\n")
+
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app.add_file_resource("file:///image.bin", path=str(f))
+
+        _, handler = app._initial_resources[0]
+        result = handler("file:///image.bin")
+        assert isinstance(result, bytes)
+
+    def test_mcp_app_add_file_resource_missing_raises(self, tmp_path):
+        from arcade_mcp_server.exceptions import NotFoundError
+
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app.add_file_resource("file:///missing.txt", path=str(tmp_path / "missing.txt"))
+
+        _, handler = app._initial_resources[0]
+        with pytest.raises(NotFoundError, match="File not found"):
+            handler("file:///missing.txt")
+
+
+class TestMCPAppMetadata:
+    """MCPApp metadata (title, icons, description, websiteUrl) wired through."""
+
+    def test_mcp_app_accepts_title(self):
+        app = MCPApp(name="TestApp", version="1.0.0", title="My Test Server")
+        assert app.title == "My Test Server"
+
+    def test_mcp_app_accepts_icons(self):
+        from arcade_mcp_server.types import Icon
+
+        app = MCPApp(
+            name="TestApp",
+            version="1.0.0",
+            icons=[Icon(src="https://example.com/icon.png")],
+        )
+        assert app.icons is not None
+        assert len(app.icons) == 1
+
+    def test_mcp_app_accepts_description(self):
+        app = MCPApp(name="TestApp", version="1.0.0", description="A test server")
+        assert app.description == "A test server"
+
+    def test_mcp_app_accepts_website_url(self):
+        app = MCPApp(name="TestApp", version="1.0.0", website_url="https://example.com")
+        assert app.website_url == "https://example.com"
+
+    def test_mcp_app_accepts_allowed_origins(self):
+        app = MCPApp(name="TestApp", version="1.0.0", allowed_origins=["https://example.com"])
+        assert app.allowed_origins == ["https://example.com"]
+
+
+class TestUnregisteredResourceDeclarations:
+    """@resource marks a function. Only adding a toolkit reads the mark."""
+
+    @staticmethod
+    def _module_holding_a_declaration(name: str):
+        from arcade_core.resources import resource
+
+        module = ModuleType(name)
+
+        @resource(path="ui.html")
+        def ui() -> str:
+            return "<html></html>"
+
+        module.ui = ui
+        return module
+
+    def test_an_app_built_from_tools_alone_warns_about_the_declaration(self):
+        """Without this the decorator imports, runs and registers nothing."""
+        module = self._module_holding_a_declaration("declaring_server")
+        sys.modules["declaring_server"] = module
+
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app._defining_module = "declaring_server"
+
+        captured: list[str] = []
+        sink = loguru_logger.add(captured.append, level="WARNING", format="{message}")
+        try:
+            app._warn_unregistered_resource_declarations()
+        finally:
+            loguru_logger.remove(sink)
+            del sys.modules["declaring_server"]
+
+        assert "declares 1 resource(s) (ui)" in "".join(captured)
+
+    def test_a_registry_that_already_holds_resources_is_not_warned_about(self):
+        """A declaration that reached the registry is the working case.
+
+        The same module still carries the marked function, so this pins that the
+        warning reads the registry rather than the mark.
+        """
+        from arcade_core.resource_schema import Resource
+
+        module = self._module_holding_a_declaration("registered_server")
+        sys.modules["registered_server"] = module
+
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app._defining_module = "registered_server"
+        app._catalog.resources.add(
+            Resource(uri="ui://Demo/1.0.0/ui.html", name="ui", mimeType="text/html"),
+            "<html></html>",
+        )
+
+        captured: list[str] = []
+        sink = loguru_logger.add(captured.append, level="WARNING", format="{message}")
+        try:
+            app._warn_unregistered_resource_declarations()
+        finally:
+            loguru_logger.remove(sink)
+            del sys.modules["registered_server"]
+
+        assert "does not register" not in "".join(captured)
+
+    def test_run_reports_the_declaration_before_starting(self):
+        """The check is worth nothing if run() stops calling it."""
+        app = MCPApp(name="TestApp", version="1.0.0")
+
+        @app.tool
+        def sample_tool(message: Annotated[str, "A message"]) -> str:
+            """A sample tool for testing."""
+            return f"Response: {message}"
+
+        with (
+            patch.object(app, "_warn_unregistered_resource_declarations") as mock_warn,
+            patch.object(app, "_run_with_reload"),
+            patch.object(app, "_create_and_run_server"),
+        ):
+            app.run(reload=False, transport="http", host="127.0.0.1", port=8000)
+
+        mock_warn.assert_called_once()
+
+    def test_an_app_with_no_declaration_says_nothing(self):
+        app = MCPApp(name="TestApp", version="1.0.0")
+        app._defining_module = "does_not_exist_anywhere"
+
+        captured: list[str] = []
+        sink = loguru_logger.add(captured.append, level="WARNING", format="{message}")
+        try:
+            app._warn_unregistered_resource_declarations()
+        finally:
+            loguru_logger.remove(sink)
+
+        assert captured == []
